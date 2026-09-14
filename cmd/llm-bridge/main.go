@@ -34,6 +34,7 @@ func main() {
 	mux.HandleFunc("/new", handler.HandleNew)
 	mux.HandleFunc("/health", handler.HandleHealth)
 	mux.HandleFunc("/ws/extension", handler.HandleWSExtension)
+	mux.HandleFunc("//ws/extension", handler.HandleWSExtension)
 
 	// OpenAI-compatible Chat Completions
 	mux.HandleFunc("/v1/chat/completions", handler.HandleChatCompletions)

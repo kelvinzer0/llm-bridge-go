@@ -1,18 +1,91 @@
-name: Release Linux Binaries
+name: Test & Release Linux
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  test:
+    name: Unit Tests & Race Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Run Unit Tests
+        run: |
+          go test -v -race -coverprofile=coverage.txt ./...
+
+  test-installer:
+    name: Test Linux Installation & Service Lifecycle
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Build Local Linux Binary
+        run: |
+          mkdir -p bin
+          go build -trimpath -ldflags="-s -w" -o bin/llm-bridge ./cmd/llm-bridge
+
+      - name: Execute Linux Installer
+        run: |
+          sudo ./scripts/install.sh
+
+      - name: Verify Binary and Configuration
+        run: |
+          test -x /usr/local/bin/llm-bridge
+          test -f /etc/llm-bridge/llm-bridge.env
+          /usr/local/bin/llm-bridge -h
+
+      - name: Verify Service Status and Health Endpoint
+        run: |
+          sleep 2
+          sudo service llm-bridge status || sudo systemctl status llm-bridge.service
+          curl -f -s http://127.0.0.1:8080/health
+
+      - name: Verify Service Restart Cycle
+        run: |
+          sudo service llm-bridge restart || sudo systemctl restart llm-bridge.service
+          sleep 2
+          sudo service llm-bridge status || sudo systemctl status llm-bridge.service
+          curl -f -s http://127.0.0.1:8080/health
+
+      - name: Test Uninstallation
+        run: |
+          sudo ./scripts/uninstall.sh
+          if [ -f /usr/local/bin/llm-bridge ]; then
+            echo "Error: Binary was not removed after uninstallation" >&2
+            exit 1
+          fi
+          echo "Uninstallation verified successfully."
+
   build-linux:
     name: Build Linux ${{ matrix.goarch }}
     runs-on: ubuntu-latest
+    needs: [test, test-installer]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         include:
@@ -58,9 +131,10 @@ jobs:
           retention-days: 1
 
   release:
-    name: Create GitHub Release
+    name: Publish GitHub Release
     needs: build-linux
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all Linux build artifacts
         uses: actions/download-artifact@v4
@@ -75,7 +149,6 @@ jobs:
 
       - name: Publish Release to GitHub
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: release_artifacts/*
           generate_release_notes: true

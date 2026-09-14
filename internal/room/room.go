@@ -183,7 +183,12 @@ func (r *Room) ResolveModelID(rawID string) (string, bool) {
 	rawLower := strings.ToLower(strings.TrimSpace(rawID))
 	for id := range r.models {
 		idLower := strings.ToLower(id)
-		if idLower == cleanID || idLower == rawLower {
+		idBase := idLower
+		if strings.Contains(idLower, "/") {
+			parts := strings.Split(idLower, "/")
+			idBase = parts[len(parts)-1]
+		}
+		if idLower == cleanID || idLower == rawLower || idBase == cleanID || idBase == rawLower {
 			return id, true
 		}
 	}

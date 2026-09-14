@@ -1,4 +1,4 @@
-package main
+package room
 
 import (
 	"errors"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/kelvinzer0/llm-bridge-go/internal/protocol"
 )
 
 type PendingCompletion struct {
@@ -15,8 +16,8 @@ type PendingCompletion struct {
 	CompletionID string
 	Created      int64
 	Streaming    bool
-	StreamChan   chan *ExtensionMessage
-	ResultChan   chan *ExtensionMessage
+	StreamChan   chan *protocol.ExtensionMessage
+	ResultChan   chan *protocol.ExtensionMessage
 	ErrChan      chan error
 }
 
@@ -27,14 +28,14 @@ type PendingResponses struct {
 	MessageID  string
 	Created    int64
 	Streaming  bool
-	StreamChan chan *ExtensionMessage
-	ResultChan chan *ExtensionMessage
+	StreamChan chan *protocol.ExtensionMessage
+	ResultChan chan *protocol.ExtensionMessage
 	ErrChan    chan error
 }
 
 type PendingEmbedding struct {
 	RequestID  string
-	ResultChan chan *ExtensionMessage
+	ResultChan chan *protocol.ExtensionMessage
 	ErrChan    chan error
 }
 
@@ -42,7 +43,7 @@ type Room struct {
 	ID                 string
 	Token              string
 	mu                 sync.RWMutex
-	models             map[string]ModelDefinition
+	models             map[string]protocol.ModelDefinition
 	ws                 *websocket.Conn
 	wsMu               sync.Mutex
 	pendingCompletions map[string]*PendingCompletion
@@ -50,11 +51,11 @@ type Room struct {
 	pendingEmbeddings  map[string]*PendingEmbedding
 }
 
-func NewRoom(id, token string) *Room {
+func New(id, token string) *Room {
 	return &Room{
 		ID:                 id,
 		Token:              token,
-		models:             make(map[string]ModelDefinition),
+		models:             make(map[string]protocol.ModelDefinition),
 		pendingCompletions: make(map[string]*PendingCompletion),
 		pendingResponses:   make(map[string]*PendingResponses),
 		pendingEmbeddings:  make(map[string]*PendingEmbedding),
@@ -77,9 +78,8 @@ func (r *Room) ClearWS(conn *websocket.Conn) {
 
 	if r.ws == conn {
 		r.ws = nil
-		r.models = make(map[string]ModelDefinition)
+		r.models = make(map[string]protocol.ModelDefinition)
 
-		// Abort any pending completions
 		for id, pc := range r.pendingCompletions {
 			select {
 			case pc.ErrChan <- errors.New("extension disconnected"):
@@ -128,7 +128,7 @@ func (r *Room) SendWSJSON(v interface{}) error {
 	return conn.WriteJSON(v)
 }
 
-func (r *Room) RegisterModels(models []ModelDefinition) {
+func (r *Room) RegisterModels(models []protocol.ModelDefinition) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now().Unix()
@@ -148,10 +148,10 @@ func (r *Room) UnregisterModels(ids []string) {
 	}
 }
 
-func (r *Room) GetModels() []ModelDefinition {
+func (r *Room) GetModels() []protocol.ModelDefinition {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	list := make([]ModelDefinition, 0, len(r.models))
+	list := make([]protocol.ModelDefinition, 0, len(r.models))
 	for _, m := range r.models {
 		list = append(list, m)
 	}
@@ -191,14 +191,12 @@ func (r *Room) ResolveModelID(rawID string) (string, bool) {
 	return "", false
 }
 
-func (r *Room) GetModel(id string) (ModelDefinition, bool) {
+func (r *Room) GetModel(id string) (protocol.ModelDefinition, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	m, ok := r.models[id]
 	return m, ok
 }
-
-// ── Completion handlers ──
 
 func (r *Room) AddPendingCompletion(pc *PendingCompletion) {
 	r.mu.Lock()
@@ -236,9 +234,7 @@ func (r *Room) RemovePendingEmbedding(requestID string) {
 	delete(r.pendingEmbeddings, requestID)
 }
 
-// ── Dispatch incoming message to matching pending request ──
-
-func (r *Room) DispatchExtensionMessage(msg *ExtensionMessage) {
+func (r *Room) DispatchExtensionMessage(msg *protocol.ExtensionMessage) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -247,7 +243,6 @@ func (r *Room) DispatchExtensionMessage(msg *ExtensionMessage) {
 		return
 	}
 
-	// 1. Check completions
 	if pc, exists := r.pendingCompletions[reqID]; exists {
 		switch msg.Type {
 		case "stream":
@@ -281,7 +276,6 @@ func (r *Room) DispatchExtensionMessage(msg *ExtensionMessage) {
 		return
 	}
 
-	// 2. Check responses API
 	if pr, exists := r.pendingResponses[reqID]; exists {
 		switch msg.Type {
 		case "stream":
@@ -315,7 +309,6 @@ func (r *Room) DispatchExtensionMessage(msg *ExtensionMessage) {
 		return
 	}
 
-	// 3. Check embeddings
 	if pe, exists := r.pendingEmbeddings[reqID]; exists {
 		switch msg.Type {
 		case "embedResult":

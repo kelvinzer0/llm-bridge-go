@@ -1,4 +1,4 @@
-package main
+package protocol
 
 // === Model Definition ===
 
@@ -79,7 +79,7 @@ type ResponsesRequestMessage struct {
 
 type ChatMessage struct {
 	Role       string      `json:"role"`
-	Content    interface{} `json:"content,omitempty"` // string or []content_parts
+	Content    interface{} `json:"content,omitempty"`
 	Name       string      `json:"name,omitempty"`
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"`
@@ -109,9 +109,9 @@ type ChatCompletionChoice struct {
 }
 
 type ChatCompletionChoiceMessage struct {
-	Role      string      `json:"role"`
-	Content   *string     `json:"content"`
-	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
+	Role      string     `json:"role"`
+	Content   *string    `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ChatCompletionResponse struct {
@@ -124,9 +124,9 @@ type ChatCompletionResponse struct {
 }
 
 type ChatCompletionChunkChoice struct {
-	Index        int                        `json:"index"`
-	Delta        ChatCompletionChunkDelta   `json:"delta"`
-	FinishReason *string                    `json:"finish_reason"`
+	Index        int                      `json:"index"`
+	Delta        ChatCompletionChunkDelta `json:"delta"`
+	FinishReason *string                  `json:"finish_reason"`
 }
 
 type ChatCompletionChunkDelta struct {
@@ -147,7 +147,7 @@ type ChatCompletionChunk struct {
 
 type ResponsesAPIRequest struct {
 	Model           string      `json:"model"`
-	Input           interface{} `json:"input"` // string or []ChatMessage
+	Input           interface{} `json:"input"`
 	Stream          bool        `json:"stream,omitempty"`
 	Temperature     *float64    `json:"temperature,omitempty"`
 	MaxOutputTokens *int        `json:"max_output_tokens,omitempty"`
@@ -169,7 +169,7 @@ type ResponsesAPIResponse struct {
 	ID        string                `json:"id"`
 	Object    string                `json:"object"` // "response"
 	CreatedAt int64                 `json:"created_at"`
-	Status    string                `json:"status"` // "completed" | "in_progress" | "failed"
+	Status    string                `json:"status"`
 	Model     string                `json:"model"`
 	Output    []ResponsesOutputItem `json:"output"`
 	Usage     *ResponsesUsage       `json:"usage,omitempty"`
@@ -185,7 +185,7 @@ type ResponsesUsage struct {
 
 type EmbeddingRequest struct {
 	Model      string      `json:"model"`
-	Input      interface{} `json:"input"` // string or []string
+	Input      interface{} `json:"input"`
 	Dimensions *int        `json:"dimensions,omitempty"`
 }
 

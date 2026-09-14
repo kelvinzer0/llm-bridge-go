@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"crypto/rand"
@@ -13,6 +13,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/kelvinzer0/llm-bridge-go/internal/protocol"
+	"github.com/kelvinzer0/llm-bridge-go/internal/room"
 )
 
 var upgrader = websocket.Upgrader{
@@ -23,15 +25,15 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-type Server struct {
-	hub *Hub
+type Handler struct {
+	hub *room.Hub
 }
 
-func NewServer(hub *Hub) *Server {
-	return &Server{hub: hub}
+func NewHandler(hub *room.Hub) *Handler {
+	return &Handler{hub: hub}
 }
 
-func (s *Server) getBaseURLs(r *http.Request) (httpBase, wsBase string) {
+func (h *Handler) getBaseURLs(r *http.Request) (httpBase, wsBase string) {
 	proto := "http"
 	wsProto := "ws"
 	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
@@ -84,8 +86,8 @@ func sendOpenAIError(w http.ResponseWriter, message string, status int, errType,
 		codePtr = &code
 	}
 
-	resp := OpenAIErrorResponse{
-		Error: OpenAIErrorDetail{
+	resp := protocol.OpenAIErrorResponse{
+		Error: protocol.OpenAIErrorDetail{
 			Message: message,
 			Type:    errType,
 			Code:    codePtr,
@@ -95,16 +97,32 @@ func sendOpenAIError(w http.ResponseWriter, message string, status int, errType,
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// ── Endpoints ───────────────────────────────────────────────────────
+func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request) (*room.Room, bool) {
+	token, roomID, ok := parseAuth(r)
+	if !ok {
+		sendOpenAIError(w, "Missing or invalid Authorization header. Expected: Bearer <token>_<roomId>", http.StatusUnauthorized, "invalid_request_error", "invalid_api_key")
+		return nil, false
+	}
 
-func (s *Server) HandleNew(w http.ResponseWriter, r *http.Request) {
+	rInstance, ok := h.hub.ValidateAuth(token, roomID)
+	if !ok {
+		sendOpenAIError(w, "Invalid token for the specified room", http.StatusUnauthorized, "invalid_request_error", "invalid_api_key")
+		return nil, false
+	}
+
+	return rInstance, true
+}
+
+// ── Room & Extension Routes ─────────────────────────────────────────
+
+func (h *Handler) HandleNew(w http.ResponseWriter, r *http.Request) {
 	roomID := generateRandomID(8)
 	token := generateRandomID(24)
 	apiKey := fmt.Sprintf("%s_%s", token, roomID)
 
-	_ = s.hub.CreateRoom(roomID, token)
+	_ = h.hub.Create(roomID, token)
 
-	httpBase, wsBase := s.getBaseURLs(r)
+	httpBase, wsBase := h.getBaseURLs(r)
 
 	resp := map[string]interface{}{
 		"room":          roomID,
@@ -122,20 +140,20 @@ func (s *Server) HandleNew(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		roomID = "default"
 	}
 
-	room := s.hub.GetRoom(roomID)
+	rInstance := h.hub.Get(roomID)
 	isConnected := false
 	modelsRegistered := 0
 	modelIDs := []string{}
 
-	if room != nil {
-		isConnected = room.IsConnected()
-		models := room.GetModels()
+	if rInstance != nil {
+		isConnected = rInstance.IsConnected()
+		models := rInstance.GetModels()
 		modelsRegistered = len(models)
 		for _, m := range models {
 			modelIDs = append(modelIDs, m.ID)
@@ -151,13 +169,13 @@ func (s *Server) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		roomID = "default"
 	}
 
-	room := s.hub.GetOrCreateRoom(roomID, "")
+	rInstance := h.hub.GetOrCreate(roomID, "")
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -165,9 +183,9 @@ func (s *Server) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	room.SetWS(conn)
+	rInstance.SetWS(conn)
 	defer func() {
-		room.ClearWS(conn)
+		rInstance.ClearWS(conn)
 		_ = conn.Close()
 	}()
 
@@ -182,7 +200,7 @@ func (s *Server) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := room.SendWSJSON(map[string]string{"type": "ping"}); err != nil {
+				if err := rInstance.SendWSJSON(map[string]string{"type": "ping"}); err != nil {
 					return
 				}
 			case <-done:
@@ -200,7 +218,7 @@ func (s *Server) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		var msg ExtensionMessage
+		var msg protocol.ExtensionMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
 			continue
 		}
@@ -208,49 +226,33 @@ func (s *Server) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case "registerModels":
 			if len(msg.Models) > 0 {
-				room.RegisterModels(msg.Models)
+				rInstance.RegisterModels(msg.Models)
 				log.Printf("[Room %s] Registered %d models", roomID, len(msg.Models))
 			}
 		case "unregisterModels":
 			if len(msg.IDs) > 0 {
-				room.UnregisterModels(msg.IDs)
+				rInstance.UnregisterModels(msg.IDs)
 				log.Printf("[Room %s] Unregistered %d models", roomID, len(msg.IDs))
 			}
 		case "stream", "response", "streamError", "embedResult":
-			room.DispatchExtensionMessage(&msg)
+			rInstance.DispatchExtensionMessage(&msg)
 		case "pong":
-			// heartbeat
+			// keepalive
 		}
 	}
 
 	log.Printf("[WS] Extension disconnected from room '%s'", roomID)
 }
 
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (*Room, bool) {
-	token, roomID, ok := parseAuth(r)
-	if !ok {
-		sendOpenAIError(w, "Missing or invalid Authorization header. Expected: Bearer <token>_<roomId>", http.StatusUnauthorized, "invalid_request_error", "invalid_api_key")
-		return nil, false
-	}
-
-	room, ok := s.hub.ValidateAuth(token, roomID)
-	if !ok {
-		sendOpenAIError(w, "Invalid token for the specified room", http.StatusUnauthorized, "invalid_request_error", "invalid_api_key")
-		return nil, false
-	}
-
-	return room, true
-}
-
 // ── /v1/chat/completions ────────────────────────────────────────────
 
-func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	room, ok := s.authenticate(w, r)
+	rInstance, ok := h.authenticate(w, r)
 	if !ok {
 		return
 	}
@@ -261,7 +263,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req ChatCompletionRequest
+	var req protocol.ChatCompletionRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		sendOpenAIError(w, "Invalid JSON body", http.StatusBadRequest, "invalid_request_error", "")
 		return
@@ -276,13 +278,13 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolvedModel, exists := room.ResolveModelID(req.Model)
+	resolvedModel, exists := rInstance.ResolveModelID(req.Model)
 	if !exists {
 		sendOpenAIError(w, fmt.Sprintf("Model '%s' not found", req.Model), http.StatusNotFound, "invalid_request_error", "model_not_found")
 		return
 	}
 
-	if !room.IsConnected() {
+	if !rInstance.IsConnected() {
 		sendOpenAIError(w, "Extension not connected", http.StatusServiceUnavailable, "server_error", "")
 		return
 	}
@@ -292,17 +294,17 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	created := time.Now().Unix()
 
 	if req.Stream {
-		s.handleStreamingCompletions(w, r, room, req, requestID, completionID, resolvedModel, created)
+		h.handleStreamingCompletions(w, r, rInstance, req, requestID, completionID, resolvedModel, created)
 	} else {
-		s.handleNonStreamingCompletions(w, r, room, req, requestID, completionID, resolvedModel, created)
+		h.handleNonStreamingCompletions(w, r, rInstance, req, requestID, completionID, resolvedModel, created)
 	}
 }
 
-func (s *Server) handleStreamingCompletions(
+func (h *Handler) handleStreamingCompletions(
 	w http.ResponseWriter,
 	r *http.Request,
-	room *Room,
-	req ChatCompletionRequest,
+	rInstance *room.Room,
+	req protocol.ChatCompletionRequest,
 	requestID, completionID, resolvedModel string,
 	created int64,
 ) {
@@ -317,16 +319,15 @@ func (s *Server) handleStreamingCompletions(
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	// 1. Send initial role chunk
-	initChunk := ChatCompletionChunk{
+	initChunk := protocol.ChatCompletionChunk{
 		ID:      completionID,
 		Object:  "chat.completion.chunk",
 		Created: created,
 		Model:   resolvedModel,
-		Choices: []ChatCompletionChunkChoice{
+		Choices: []protocol.ChatCompletionChunkChoice{
 			{
 				Index: 0,
-				Delta: ChatCompletionChunkDelta{
+				Delta: protocol.ChatCompletionChunkDelta{
 					Role: "assistant",
 				},
 				FinishReason: nil,
@@ -337,11 +338,10 @@ func (s *Server) handleStreamingCompletions(
 	_, _ = fmt.Fprintf(w, "data: %s\n\n", initJSON)
 	flusher.Flush()
 
-	// 2. Register pending completion
-	streamChan := make(chan *ExtensionMessage, 100)
+	streamChan := make(chan *protocol.ExtensionMessage, 100)
 	errChan := make(chan error, 1)
 
-	pc := &PendingCompletion{
+	pc := &room.PendingCompletion{
 		RequestID:    requestID,
 		Model:        resolvedModel,
 		CompletionID: completionID,
@@ -351,21 +351,19 @@ func (s *Server) handleStreamingCompletions(
 		ErrChan:      errChan,
 	}
 
-	room.AddPendingCompletion(pc)
-	defer room.RemovePendingCompletion(requestID)
+	rInstance.AddPendingCompletion(pc)
+	defer rInstance.RemovePendingCompletion(requestID)
 
-	// 3. Send request to extension
-	wsReq := CompletionRequestMessage{
+	wsReq := protocol.CompletionRequestMessage{
 		Type:      "completionRequest",
 		RequestID: requestID,
 		Request:   req,
 	}
-	if err := room.SendWSJSON(wsReq); err != nil {
+	if err := rInstance.SendWSJSON(wsReq); err != nil {
 		sendStreamError(w, flusher, err.Error())
 		return
 	}
 
-	// 4. Stream loop
 	timeout := time.After(300 * time.Second)
 
 	for {
@@ -384,15 +382,15 @@ func (s *Server) handleStreamingCompletions(
 			}
 			if msg.Type == "stream" && msg.Delta != nil {
 				content := msg.Delta.Content
-				chunk := ChatCompletionChunk{
+				chunk := protocol.ChatCompletionChunk{
 					ID:      completionID,
 					Object:  "chat.completion.chunk",
 					Created: created,
 					Model:   resolvedModel,
-					Choices: []ChatCompletionChunkChoice{
+					Choices: []protocol.ChatCompletionChunkChoice{
 						{
 							Index: 0,
-							Delta: ChatCompletionChunkDelta{
+							Delta: protocol.ChatCompletionChunkDelta{
 								Content: &content,
 							},
 							FinishReason: nil,
@@ -410,15 +408,15 @@ func (s *Server) handleStreamingCompletions(
 					finishReason = "tool_calls"
 				}
 
-				finalChunk := ChatCompletionChunk{
+				finalChunk := protocol.ChatCompletionChunk{
 					ID:      completionID,
 					Object:  "chat.completion.chunk",
 					Created: created,
 					Model:   resolvedModel,
-					Choices: []ChatCompletionChunkChoice{
+					Choices: []protocol.ChatCompletionChunkChoice{
 						{
 							Index: 0,
-							Delta: ChatCompletionChunkDelta{
+							Delta: protocol.ChatCompletionChunkDelta{
 								ToolCalls: msg.ToolCalls,
 							},
 							FinishReason: &finishReason,
@@ -436,8 +434,8 @@ func (s *Server) handleStreamingCompletions(
 }
 
 func sendStreamError(w http.ResponseWriter, flusher http.Flusher, errMessage string) {
-	errResp := OpenAIErrorResponse{
-		Error: OpenAIErrorDetail{
+	errResp := protocol.OpenAIErrorResponse{
+		Error: protocol.OpenAIErrorDetail{
 			Message: errMessage,
 			Type:    "server_error",
 			Code:    nil,
@@ -450,18 +448,18 @@ func sendStreamError(w http.ResponseWriter, flusher http.Flusher, errMessage str
 	flusher.Flush()
 }
 
-func (s *Server) handleNonStreamingCompletions(
+func (h *Handler) handleNonStreamingCompletions(
 	w http.ResponseWriter,
 	r *http.Request,
-	room *Room,
-	req ChatCompletionRequest,
+	rInstance *room.Room,
+	req protocol.ChatCompletionRequest,
 	requestID, completionID, resolvedModel string,
 	created int64,
 ) {
-	resultChan := make(chan *ExtensionMessage, 1)
+	resultChan := make(chan *protocol.ExtensionMessage, 1)
 	errChan := make(chan error, 1)
 
-	pc := &PendingCompletion{
+	pc := &room.PendingCompletion{
 		RequestID:    requestID,
 		Model:        resolvedModel,
 		CompletionID: completionID,
@@ -471,15 +469,15 @@ func (s *Server) handleNonStreamingCompletions(
 		ErrChan:      errChan,
 	}
 
-	room.AddPendingCompletion(pc)
-	defer room.RemovePendingCompletion(requestID)
+	rInstance.AddPendingCompletion(pc)
+	defer rInstance.RemovePendingCompletion(requestID)
 
-	wsReq := CompletionRequestMessage{
+	wsReq := protocol.CompletionRequestMessage{
 		Type:      "completionRequest",
 		RequestID: requestID,
 		Request:   req,
 	}
-	if err := room.SendWSJSON(wsReq); err != nil {
+	if err := rInstance.SendWSJSON(wsReq); err != nil {
 		sendOpenAIError(w, err.Error(), http.StatusInternalServerError, "server_error", "")
 		return
 	}
@@ -506,7 +504,7 @@ func (s *Server) handleNonStreamingCompletions(
 			content = msg.Content
 		}
 
-		usage := UsageInfo{
+		usage := protocol.UsageInfo{
 			PromptTokens:     0,
 			CompletionTokens: 0,
 			TotalTokens:      0,
@@ -515,15 +513,15 @@ func (s *Server) handleNonStreamingCompletions(
 			usage = *msg.Usage
 		}
 
-		resp := ChatCompletionResponse{
+		resp := protocol.ChatCompletionResponse{
 			ID:      completionID,
 			Object:  "chat.completion",
 			Created: created,
 			Model:   resolvedModel,
-			Choices: []ChatCompletionChoice{
+			Choices: []protocol.ChatCompletionChoice{
 				{
 					Index: 0,
-					Message: ChatCompletionChoiceMessage{
+					Message: protocol.ChatCompletionChoiceMessage{
 						Role:      "assistant",
 						Content:   content,
 						ToolCalls: msg.ToolCalls,
@@ -541,13 +539,13 @@ func (s *Server) handleNonStreamingCompletions(
 
 // ── /v1/responses ───────────────────────────────────────────────────
 
-func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	room, ok := s.authenticate(w, r)
+	rInstance, ok := h.authenticate(w, r)
 	if !ok {
 		return
 	}
@@ -558,7 +556,7 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req ResponsesAPIRequest
+	var req protocol.ResponsesAPIRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		sendOpenAIError(w, "Invalid JSON body", http.StatusBadRequest, "invalid_request_error", "")
 		return
@@ -573,13 +571,13 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolvedModel, exists := room.ResolveModelID(req.Model)
+	resolvedModel, exists := rInstance.ResolveModelID(req.Model)
 	if !exists {
 		sendOpenAIError(w, fmt.Sprintf("Model '%s' not found", req.Model), http.StatusNotFound, "invalid_request_error", "model_not_found")
 		return
 	}
 
-	if !room.IsConnected() {
+	if !rInstance.IsConnected() {
 		sendOpenAIError(w, "Extension not connected", http.StatusServiceUnavailable, "server_error", "")
 		return
 	}
@@ -607,30 +605,30 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		initResp := ResponsesAPIResponse{
+		initResp := protocol.ResponsesAPIResponse{
 			ID:        responseID,
 			Object:    "response",
 			CreatedAt: created,
 			Status:    "in_progress",
 			Model:     resolvedModel,
-			Output:    []ResponsesOutputItem{},
+			Output:    []protocol.ResponsesOutputItem{},
 		}
 		writeEvent("response.created", map[string]interface{}{"type": "response.created", "response": initResp})
 		writeEvent("response.in_progress", map[string]interface{}{"type": "response.in_progress", "response": initResp})
 
-		outItem := ResponsesOutputItem{
+		outItem := protocol.ResponsesOutputItem{
 			Type:    "message",
 			ID:      messageID,
 			Role:    "assistant",
-			Content: []ResponsesContentPart{},
+			Content: []protocol.ResponsesContentPart{},
 		}
 		writeEvent("response.output_item.added", map[string]interface{}{"type": "response.output_item.added", "output_index": 0, "item": outItem})
-		writeEvent("response.content_part.added", map[string]interface{}{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "part": ResponsesContentPart{Type: "output_text", Text: ""}})
+		writeEvent("response.content_part.added", map[string]interface{}{"type": "response.content_part.added", "output_index": 0, "content_index": 0, "part": protocol.ResponsesContentPart{Type: "output_text", Text: ""}})
 
-		streamChan := make(chan *ExtensionMessage, 100)
+		streamChan := make(chan *protocol.ExtensionMessage, 100)
 		errChan := make(chan error, 1)
 
-		pr := &PendingResponses{
+		pr := &room.PendingResponses{
 			RequestID:  requestID,
 			Model:      resolvedModel,
 			ResponseID: responseID,
@@ -641,15 +639,15 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			ErrChan:    errChan,
 		}
 
-		room.AddPendingResponses(pr)
-		defer room.RemovePendingResponses(requestID)
+		rInstance.AddPendingResponses(pr)
+		defer rInstance.RemovePendingResponses(requestID)
 
-		wsReq := ResponsesRequestMessage{
+		wsReq := protocol.ResponsesRequestMessage{
 			Type:      "responsesRequest",
 			RequestID: requestID,
 			Request:   req,
 		}
-		_ = room.SendWSJSON(wsReq)
+		_ = rInstance.SendWSJSON(wsReq)
 
 		var fullContent strings.Builder
 		for {
@@ -689,15 +687,15 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 					writeEvent("response.output_item.done", map[string]interface{}{
 						"type":         "response.output_item.done",
 						"output_index": 0,
-						"item": ResponsesOutputItem{
+						"item": protocol.ResponsesOutputItem{
 							Type:    "message",
 							ID:      messageID,
 							Role:    "assistant",
-							Content: []ResponsesContentPart{{Type: "output_text", Text: text}},
+							Content: []protocol.ResponsesContentPart{{Type: "output_text", Text: text}},
 						},
 					})
 
-					usage := &ResponsesUsage{InputTokens: 0, OutputTokens: 0, TotalTokens: 0}
+					usage := &protocol.ResponsesUsage{InputTokens: 0, OutputTokens: 0, TotalTokens: 0}
 					if msg.Usage != nil {
 						usage.InputTokens = msg.Usage.PromptTokens
 						usage.OutputTokens = msg.Usage.CompletionTokens
@@ -706,18 +704,18 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 					writeEvent("response.completed", map[string]interface{}{
 						"type": "response.completed",
-						"response": ResponsesAPIResponse{
+						"response": protocol.ResponsesAPIResponse{
 							ID:        responseID,
 							Object:    "response",
 							CreatedAt: created,
 							Status:    "completed",
 							Model:     resolvedModel,
-							Output: []ResponsesOutputItem{
+							Output: []protocol.ResponsesOutputItem{
 								{
 									Type:    "message",
 									ID:      messageID,
 									Role:    "assistant",
-									Content: []ResponsesContentPart{{Type: "output_text", Text: text}},
+									Content: []protocol.ResponsesContentPart{{Type: "output_text", Text: text}},
 								},
 							},
 							Usage: usage,
@@ -728,10 +726,10 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		resultChan := make(chan *ExtensionMessage, 1)
+		resultChan := make(chan *protocol.ExtensionMessage, 1)
 		errChan := make(chan error, 1)
 
-		pr := &PendingResponses{
+		pr := &room.PendingResponses{
 			RequestID:  requestID,
 			Model:      resolvedModel,
 			ResponseID: responseID,
@@ -742,15 +740,15 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 			ErrChan:    errChan,
 		}
 
-		room.AddPendingResponses(pr)
-		defer room.RemovePendingResponses(requestID)
+		rInstance.AddPendingResponses(pr)
+		defer rInstance.RemovePendingResponses(requestID)
 
-		wsReq := ResponsesRequestMessage{
+		wsReq := protocol.ResponsesRequestMessage{
 			Type:      "responsesRequest",
 			RequestID: requestID,
 			Request:   req,
 		}
-		if err := room.SendWSJSON(wsReq); err != nil {
+		if err := rInstance.SendWSJSON(wsReq); err != nil {
 			sendOpenAIError(w, err.Error(), http.StatusInternalServerError, "server_error", "")
 			return
 		}
@@ -770,25 +768,25 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 				text = *msg.Content
 			}
 
-			usage := &ResponsesUsage{InputTokens: 0, OutputTokens: 0, TotalTokens: 0}
+			usage := &protocol.ResponsesUsage{InputTokens: 0, OutputTokens: 0, TotalTokens: 0}
 			if msg.Usage != nil {
 				usage.InputTokens = msg.Usage.PromptTokens
 				usage.OutputTokens = msg.Usage.CompletionTokens
 				usage.TotalTokens = msg.Usage.TotalTokens
 			}
 
-			resp := ResponsesAPIResponse{
+			resp := protocol.ResponsesAPIResponse{
 				ID:        responseID,
 				Object:    "response",
 				CreatedAt: created,
 				Status:    "completed",
 				Model:     resolvedModel,
-				Output: []ResponsesOutputItem{
+				Output: []protocol.ResponsesOutputItem{
 					{
 						Type:    "message",
 						ID:      messageID,
 						Role:    "assistant",
-						Content: []ResponsesContentPart{{Type: "output_text", Text: text}},
+						Content: []protocol.ResponsesContentPart{{Type: "output_text", Text: text}},
 					},
 				},
 				Usage: usage,
@@ -802,13 +800,13 @@ func (s *Server) HandleResponses(w http.ResponseWriter, r *http.Request) {
 
 // ── /v1/embeddings ──────────────────────────────────────────────────
 
-func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	room, ok := s.authenticate(w, r)
+	rInstance, ok := h.authenticate(w, r)
 	if !ok {
 		return
 	}
@@ -819,7 +817,7 @@ func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req EmbeddingRequest
+	var req protocol.EmbeddingRequest
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		sendOpenAIError(w, "Invalid JSON body", http.StatusBadRequest, "invalid_request_error", "")
 		return
@@ -834,36 +832,36 @@ func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolvedModel, exists := room.ResolveModelID(req.Model)
+	resolvedModel, exists := rInstance.ResolveModelID(req.Model)
 	if !exists {
 		sendOpenAIError(w, fmt.Sprintf("Model '%s' not found", req.Model), http.StatusNotFound, "invalid_request_error", "model_not_found")
 		return
 	}
 
-	if !room.IsConnected() {
+	if !rInstance.IsConnected() {
 		sendOpenAIError(w, "Extension not connected", http.StatusServiceUnavailable, "server_error", "")
 		return
 	}
 
 	requestID := uuid.NewString()
-	resultChan := make(chan *ExtensionMessage, 1)
+	resultChan := make(chan *protocol.ExtensionMessage, 1)
 	errChan := make(chan error, 1)
 
-	pe := &PendingEmbedding{
+	pe := &room.PendingEmbedding{
 		RequestID:  requestID,
 		ResultChan: resultChan,
 		ErrChan:    errChan,
 	}
 
-	room.AddPendingEmbedding(pe)
-	defer room.RemovePendingEmbedding(requestID)
+	rInstance.AddPendingEmbedding(pe)
+	defer rInstance.RemovePendingEmbedding(requestID)
 
-	wsReq := EmbeddingRequestMessage{
+	wsReq := protocol.EmbeddingRequestMessage{
 		Type:      "embeddingRequest",
 		RequestID: requestID,
 		Request:   req,
 	}
-	if err := room.SendWSJSON(wsReq); err != nil {
+	if err := rInstance.SendWSJSON(wsReq); err != nil {
 		sendOpenAIError(w, err.Error(), http.StatusInternalServerError, "server_error", "")
 		return
 	}
@@ -878,21 +876,21 @@ func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		sendOpenAIError(w, err.Error(), http.StatusInternalServerError, "server_error", "")
 		return
 	case msg := <-resultChan:
-		embData := make([]EmbeddingData, 0, len(msg.Embeddings))
+		embData := make([]protocol.EmbeddingData, 0, len(msg.Embeddings))
 		for i, emb := range msg.Embeddings {
-			embData = append(embData, EmbeddingData{
+			embData = append(embData, protocol.EmbeddingData{
 				Object:    "embedding",
 				Index:     i,
 				Embedding: emb,
 			})
 		}
 
-		usage := UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0}
+		usage := protocol.UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0}
 		if msg.Usage != nil {
 			usage = *msg.Usage
 		}
 
-		resp := EmbeddingResponse{
+		resp := protocol.EmbeddingResponse{
 			Object: "list",
 			Data:   embData,
 			Model:  resolvedModel,
@@ -906,30 +904,29 @@ func (s *Server) HandleEmbeddings(w http.ResponseWriter, r *http.Request) {
 
 // ── /v1/models ──────────────────────────────────────────────────────
 
-func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	room, ok := s.authenticate(w, r)
+	rInstance, ok := h.authenticate(w, r)
 	if !ok {
 		return
 	}
 
-	// Check if specific model is requested: /v1/models/{id} or /models/{id}
 	path := strings.TrimPrefix(r.URL.Path, "/v1/models")
 	path = strings.TrimPrefix(path, "/models")
 	path = strings.TrimPrefix(path, "/")
 
 	if path != "" {
-		model, found := room.GetModel(path)
+		model, found := rInstance.GetModel(path)
 		if !found {
 			sendOpenAIError(w, fmt.Sprintf("Model '%s' not found", path), http.StatusNotFound, "invalid_request_error", "model_not_found")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ModelObject{
+		_ = json.NewEncoder(w).Encode(protocol.ModelObject{
 			ID:      model.ID,
 			Object:  "model",
 			Created: model.Created,
@@ -938,10 +935,10 @@ func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models := room.GetModels()
-	data := make([]ModelObject, 0, len(models))
+	models := rInstance.GetModels()
+	data := make([]protocol.ModelObject, 0, len(models))
 	for _, m := range models {
-		data = append(data, ModelObject{
+		data = append(data, protocol.ModelObject{
 			ID:      m.ID,
 			Object:  "model",
 			Created: m.Created,
@@ -950,27 +947,8 @@ func (s *Server) HandleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ModelsListResponse{
+	_ = json.NewEncoder(w).Encode(protocol.ModelsListResponse{
 		Object: "list",
 		Data:   data,
-	})
-}
-
-// ── CORS Middleware ─────────────────────────────────────────────────
-
-func CorsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-		w.Header().Set("Access-Control-Expose-Headers", "*")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
 	})
 }

@@ -1,0 +1,15 @@
+[Unit]
+Description=LLM Bridge Server (Go)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-/etc/llm-bridge/llm-bridge.env
+ExecStart=/usr/local/bin/llm-bridge -host ${HOST} -port ${PORT}
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

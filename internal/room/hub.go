@@ -1,4 +1,4 @@
-package main
+package room
 
 import (
 	"sync"
@@ -15,34 +15,33 @@ func NewHub() *Hub {
 	}
 }
 
-func (h *Hub) CreateRoom(id, token string) *Room {
+func (h *Hub) Create(id, token string) *Room {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	r := NewRoom(id, token)
+	r := New(id, token)
 	h.rooms[id] = r
 	return r
 }
 
-func (h *Hub) GetRoom(id string) *Room {
+func (h *Hub) Get(id string) *Room {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.rooms[id]
 }
 
-func (h *Hub) GetOrCreateRoom(id, token string) *Room {
+func (h *Hub) GetOrCreate(id, token string) *Room {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if r, exists := h.rooms[id]; exists {
-		// Update token if was empty
 		if r.Token == "" && token != "" {
 			r.Token = token
 		}
 		return r
 	}
 
-	r := NewRoom(id, token)
+	r := New(id, token)
 	h.rooms[id] = r
 	return r
 }
@@ -53,8 +52,7 @@ func (h *Hub) ValidateAuth(token, roomID string) (*Room, bool) {
 
 	r, exists := h.rooms[roomID]
 	if !exists {
-		// Auto-register room with provided token for self-host convenience
-		r = NewRoom(roomID, token)
+		r = New(roomID, token)
 		h.rooms[roomID] = r
 		return r, true
 	}

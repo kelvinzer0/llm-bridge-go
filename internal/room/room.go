@@ -78,7 +78,7 @@ func (r *Room) ClearWS(conn *websocket.Conn) {
 
 	if r.ws == conn {
 		r.ws = nil
-		r.models = make(map[string]protocol.ModelDefinition)
+		// Jangan hapus models! Pertahankan models di room agar /v1/models tetap tersedia saat extension reload/reconnect
 
 		for id, pc := range r.pendingCompletions {
 			select {
@@ -148,9 +148,29 @@ func (r *Room) UnregisterModels(ids []string) {
 	}
 }
 
+var defaultPresets = []string{
+	"chatgpt", "claude", "qwen", "deepseek", "gemini", "grok",
+	"perplexity", "kimi", "doubao", "mistral", "copilot", "xiaomimo",
+	"chatsmith", "glm", "poe", "duckduckgo", "huggingchat", "generic-ai",
+}
+
 func (r *Room) GetModels() []protocol.ModelDefinition {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if len(r.models) == 0 {
+		now := time.Now().Unix()
+		fallback := make([]protocol.ModelDefinition, 0, len(defaultPresets))
+		for _, id := range defaultPresets {
+			fallback = append(fallback, protocol.ModelDefinition{
+				ID:          id,
+				Name:        id,
+				OwnedBy:     "zerollm-extension",
+				Description: "Web AI model for " + id,
+				Created:     now,
+			})
+		}
+		return fallback
+	}
 	list := make([]protocol.ModelDefinition, 0, len(r.models))
 	for _, m := range r.models {
 		list = append(list, m)
@@ -193,6 +213,13 @@ func (r *Room) ResolveModelID(rawID string) (string, bool) {
 		}
 	}
 
+	// Fallback ke defaultPresets jika models belum selesai disinkronkan oleh ekstensi
+	for _, p := range defaultPresets {
+		if p == cleanID || p == rawLower {
+			return p, true
+		}
+	}
+
 	return "", false
 }
 
@@ -200,7 +227,24 @@ func (r *Room) GetModel(id string) (protocol.ModelDefinition, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	m, ok := r.models[id]
-	return m, ok
+	if ok {
+		return m, true
+	}
+	cleanID := strings.TrimPrefix(id, "openclaw/")
+	cleanID = strings.TrimPrefix(cleanID, "zerollm/")
+	rawLower := strings.ToLower(cleanID)
+	for _, p := range defaultPresets {
+		if p == cleanID || p == rawLower {
+			return protocol.ModelDefinition{
+				ID:          p,
+				Name:        p,
+				OwnedBy:     "zerollm-extension",
+				Description: "Web AI model for " + p,
+				Created:     time.Now().Unix(),
+			}, true
+		}
+	}
+	return protocol.ModelDefinition{}, false
 }
 
 func (r *Room) AddPendingCompletion(pc *PendingCompletion) {

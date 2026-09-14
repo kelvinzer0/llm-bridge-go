@@ -191,6 +191,9 @@ func (h *Handler) HandleWSExtension(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[WS] Extension connected to room '%s'", roomID)
 
+	// Seketika minta ekstensi untuk mendaftarkan semua model yang aktif
+	_ = rInstance.SendWSJSON(map[string]string{"type": "requestModels"})
+
 	done := make(chan struct{})
 	defer close(done)
 

@@ -18,8 +18,10 @@ ROOT_DIR="$(dirname "${SCRIPT_DIR}")"
 
 echo "=== Installing ${BIN_NAME} ==="
 
-# 1. Locate or build binary
-if [ -f "${ROOT_DIR}/bin/${BIN_NAME}" ]; then
+# 1. Locate or build executable binary
+if [ -f "${SCRIPT_DIR}/bin/${BIN_NAME}" ]; then
+  cp "${SCRIPT_DIR}/bin/${BIN_NAME}" "${INSTALL_BIN}"
+elif [ -f "${ROOT_DIR}/bin/${BIN_NAME}" ]; then
   cp "${ROOT_DIR}/bin/${BIN_NAME}" "${INSTALL_BIN}"
 elif [ -f "${ROOT_DIR}/${BIN_NAME}" ]; then
   cp "${ROOT_DIR}/${BIN_NAME}" "${INSTALL_BIN}"
@@ -31,7 +33,7 @@ fi
 chmod +x "${INSTALL_BIN}"
 echo "Installed executable to ${INSTALL_BIN}"
 
-# 2. Setup configuration directory
+# 2. Setup configuration directory and env file
 mkdir -p "${CONFIG_DIR}"
 if [ ! -f "${CONFIG_FILE}" ]; then
   cat << 'EOF' > "${CONFIG_FILE}"
@@ -45,22 +47,8 @@ else
   echo "Configuration file already exists at ${CONFIG_FILE}, keeping intact."
 fi
 
-# 3. Setup service based on init system
-if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
-  echo "Configuring systemd service..."
-  cp "${SCRIPT_DIR}/${BIN_NAME}.service" "${SYSTEMD_UNIT}"
-  systemctl daemon-reload
-  systemctl enable "${BIN_NAME}.service"
-  systemctl restart "${BIN_NAME}.service"
-  echo "Systemd service enabled and started."
-  echo "Usage:"
-  echo "  service ${BIN_NAME} start"
-  echo "  service ${BIN_NAME} stop"
-  echo "  service ${BIN_NAME} restart"
-  echo "  service ${BIN_NAME} status"
-else
-  echo "Configuring SysVinit fallback service in ${INITD_SCRIPT}..."
-  cat << EOF > "${INITD_SCRIPT}"
+# 3. Always create SysVinit / service wrapper at /etc/init.d/<name>
+cat << EOF > "${INITD_SCRIPT}"
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          ${BIN_NAME}
@@ -81,13 +69,17 @@ PORT="\${PORT:-8080}"
 
 case "\$1" in
   start)
+    if [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null; then
+      echo "${BIN_NAME} is already running."
+      exit 0
+    fi
     echo "Starting ${BIN_NAME} on \$HOST:\$PORT..."
     start-stop-daemon --start --background --make-pidfile --pidfile "\$PIDFILE" \\
       --exec "\$DAEMON" -- -host "\$HOST" -port "\$PORT"
     ;;
   stop)
     echo "Stopping ${BIN_NAME}..."
-    start-stop-daemon --stop --pidfile "\$PIDFILE" --retry 5
+    start-stop-daemon --stop --pidfile "\$PIDFILE" --retry 5 2>/dev/null || true
     rm -f "\$PIDFILE"
     ;;
   restart)
@@ -96,7 +88,7 @@ case "\$1" in
     \$0 start
     ;;
   status)
-    start-stop-daemon --status --pidfile "\$PIDFILE"
+    start-stop-daemon --status --pidfile "\$PIDFILE" 2>/dev/null
     case "\$?" in
       0) echo "${BIN_NAME} is running." ;;
       1) echo "${BIN_NAME} is not running and the pid file exists." ;;
@@ -111,9 +103,33 @@ case "\$1" in
 esac
 exit 0
 EOF
-  chmod +x "${INITD_SCRIPT}"
+chmod +x "${INITD_SCRIPT}"
+
+# 4. Check init system
+is_systemd() {
+  if [ -d /run/systemd/system ] || [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]; then
+    return 0
+  fi
+  return 1
+}
+
+if is_systemd && command -v systemctl >/dev/null 2>&1; then
+  echo "Configuring systemd service..."
+  if [ -f "${SCRIPT_DIR}/${BIN_NAME}.service" ]; then
+    cp "${SCRIPT_DIR}/${BIN_NAME}.service" "${SYSTEMD_UNIT}"
+  elif [ -f "${SCRIPT_DIR}/scripts/${BIN_NAME}.service" ]; then
+    cp "${SCRIPT_DIR}/scripts/${BIN_NAME}.service" "${SYSTEMD_UNIT}"
+  elif [ -f "${ROOT_DIR}/scripts/${BIN_NAME}.service" ]; then
+    cp "${ROOT_DIR}/scripts/${BIN_NAME}.service" "${SYSTEMD_UNIT}"
+  fi
+  systemctl daemon-reload
+  systemctl enable "${BIN_NAME}.service"
+  systemctl restart "${BIN_NAME}.service"
+  echo "Systemd service configured and started."
+else
+  echo "Systemd not active or container environment detected. Using init.d..."
   if command -v update-rc.d >/dev/null 2>&1; then
-    update-rc.d "${BIN_NAME}" defaults
+    update-rc.d "${BIN_NAME}" defaults 2>/dev/null || true
   fi
   "${INITD_SCRIPT}" restart
 fi

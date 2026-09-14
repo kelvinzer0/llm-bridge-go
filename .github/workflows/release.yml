@@ -51,6 +51,7 @@ jobs:
 
       - name: Execute Linux Installer
         run: |
+          chmod +x scripts/*.sh
           sudo ./scripts/install.sh
 
       - name: Verify Binary and Configuration
@@ -63,6 +64,13 @@ jobs:
         run: |
           sleep 2
           sudo service llm-bridge status || sudo systemctl status llm-bridge.service
+          for i in {1..10}; do
+            if curl -s http://127.0.0.1:8080/health | grep -q "ok"; then
+              echo "Daemon is responding to health check."
+              break
+            fi
+            sleep 1
+          done
           curl -f -s http://127.0.0.1:8080/health
 
       - name: Verify Service Restart Cycle

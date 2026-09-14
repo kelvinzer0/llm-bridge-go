@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -17,6 +19,9 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
 		log.Fatalf("Configuration error: %v", err)
 	}
 
